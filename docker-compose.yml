@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ekos
+      POSTGRES_USER: ekos
+      POSTGRES_PASSWORD: ekos
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ekos"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ekos:ekos@postgres:5432/ekos
+      DATABASE_URL_SYNC: postgresql+psycopg2://ekos:ekos@postgres:5432/ekos
+      OKF_BUNDLE_ROOT: /data/bundles
+      GCP_PROJECT_ID: ""
+      JWT_SECRET: change-this-in-production
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - bundle_data:/data/bundles
+
+volumes:
+  pgdata:
+  bundle_data:
