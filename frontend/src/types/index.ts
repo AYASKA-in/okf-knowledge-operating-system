@@ -107,3 +107,9 @@ export interface ChatResponse {
   citations: Array<{ id: string; title: string; relevance: number }>
   conversation_id: string
 }
+
+export interface SearchResult {
+  node: Node
+  snippet: string
+  rank: number
+}

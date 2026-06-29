@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import { useNavigate } from "react-router-dom"
 import { api } from "@/lib/api"
+import { useAuth } from "@/contexts/AuthContext"
 import { Layout } from "@/components/Layout"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -35,6 +36,7 @@ function GraphSkeleton() {
 
 export default function GraphView() {
   const navigate = useNavigate()
+  const { activeWorkspaceId } = useAuth()
   const svgRef = useRef<SVGSVGElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const [conceptId, setConceptId] = useState("")
@@ -60,10 +62,11 @@ export default function GraphView() {
 
   const loadGraph = async () => {
     if (!conceptId.trim()) return
+    if (!activeWorkspaceId) { setError("Select a workspace first"); return }
     setLoading(true)
     setError("")
     try {
-      const data = await api.get<{ nodes: Node[]; edges: EdgeType[] }>(`/v1/graph/subgraph/${conceptId}?depth=2`)
+      const data = await api.get<{ nodes: Node[]; edges: EdgeType[] }>(`/v1/knowledge/${conceptId}/graph?workspace_id=${activeWorkspaceId}&depth=2`)
 
       if (!svgRef.current) return
       const svg = d3.select(svgRef.current)

@@ -48,19 +48,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [user?.role])
 
   const login = useCallback(async (email: string, password: string) => {
-    const formData = new URLSearchParams()
-    formData.append("username", email)
-    formData.append("password", password)
-    const res = await fetch(`${API_BASE}/v1/auth/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: formData,
-    })
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: "Login failed" }))
-      throw new Error(err.detail)
-    }
-    const data: AuthResponse = await res.json()
+    const data = await api.post<AuthResponse>("/v1/auth/token", { email, password })
     setTokens(data.access_token, data.refresh_token)
     const me = await api.get<User>("/v1/auth/me")
     setUser(me)

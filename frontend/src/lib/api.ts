@@ -95,4 +95,10 @@ export const api = {
     request<T>("POST", path, formData, { formData: true }),
   raw: (method: string, path: string) =>
     request<Response>(method, path, undefined, { rawResponse: true }),
+  postWithTotal: async <T>(path: string, body?: unknown): Promise<{ items: T[]; total: number }> => {
+    const resp = await request<Response>("POST", path, body, { rawResponse: true })
+    const items: T[] = await resp.json()
+    const total = parseInt(resp.headers.get("X-Total-Count") || "0", 10)
+    return { items, total }
+  },
 }
