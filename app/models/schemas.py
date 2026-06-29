@@ -3,6 +3,15 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 
+class IngestionUploadResponse(BaseModel):
+    status: str
+    workspace_id: str
+    filename: str
+    source_type: str
+    concepts_created: int
+    sections: int
+
+
 class ConceptCreate(BaseModel):
     type: str
     title: Optional[str] = None

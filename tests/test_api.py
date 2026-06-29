@@ -682,6 +682,43 @@ class TestIngestEndpoint:
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 
+    @pytest.mark.asyncio
+    async def test_ingest_upload_html(self, test_db, seed_data):
+        html_content = b"<html><head><title>Upload Test</title></head><body><h1>Section 1</h1><p>Content</p></body></html>"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/v1/ingest/upload?workspace_id=test-ws-1",
+                headers={"Authorization": f"Bearer {seed_data['token']}"},
+                files={"file": ("test.html", html_content, "text/html")},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["filename"] == "test.html"
+        assert data["source_type"] == "html"
+        assert data["concepts_created"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_ingest_upload_unsupported(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/v1/ingest/upload?workspace_id=test-ws-1",
+                headers={"Authorization": f"Bearer {seed_data['token']}"},
+                files={"file": ("data.bin", b"\x00\x01\x02\x03", "application/octet-stream")},
+            )
+        assert resp.status_code == 400
+        assert "Unsupported" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_ingest_upload_empty(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/v1/ingest/upload?workspace_id=test-ws-1",
+                headers={"Authorization": f"Bearer {seed_data['token']}"},
+                files={"file": ("empty.txt", b"", "text/plain")},
+            )
+        assert resp.status_code == 400
+
 
 class TestChatEndpoint:
     @pytest.mark.asyncio
