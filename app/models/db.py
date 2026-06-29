@@ -56,6 +56,7 @@ class AuditAction(str, enum.Enum):
     reject = "reject"
     export = "export"
     delete = "delete"
+    ingest = "ingest"
 
 
 class Workspace(Base):

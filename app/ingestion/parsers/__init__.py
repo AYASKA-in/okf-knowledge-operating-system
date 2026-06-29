@@ -7,6 +7,8 @@ from app.ingestion.parsers.pdf_parser import PdfParser
 from app.ingestion.parsers.docx_parser import DocxParser
 from app.ingestion.parsers.xlsx_parser import XlsxParser
 from app.ingestion.parsers.html_parser import HtmlParser
+from app.ingestion.parsers.csv_parser import CsvParser
+from app.ingestion.parsers.notion_parser import NotionParser
 
 
 _REGISTRY: dict[str, type[DocumentParser]] = {
@@ -14,6 +16,8 @@ _REGISTRY: dict[str, type[DocumentParser]] = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": DocxParser,
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": XlsxParser,
     "text/html": HtmlParser,
+    "text/csv": CsvParser,
+    "application/json": NotionParser,
 }
 
 _EXTENSION_MAP: dict[str, str] = {
@@ -22,6 +26,8 @@ _EXTENSION_MAP: dict[str, str] = {
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".html": "text/html",
     ".htm": "text/html",
+    ".csv": "text/csv",
+    ".json": "application/json",
 }
 
 def _looks_like_html(data: bytes) -> bool:

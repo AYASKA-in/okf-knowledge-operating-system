@@ -13,21 +13,22 @@ from app.models.db import (
     Workspace, Node, Edge, EdgeType, NodeStatus, AuditLog, AuditAction,
     IngestJob, IngestJobStatus, ConnectorConfig, new_uuid,
 )
-from app.agents.ingestor import IngestorAgent
-from app.agents.structurer import StructurerAgent
-from app.agents.linker import LinkerAgent
 from app.storage.bundle import BundleManager
 from app.config import settings
 from app.auth.deps import require_role
 from app.llm import get_llm_client
-from app.ingestion import detect_format, parse_document
+from app.pipeline import PipelineOrchestrator, PipelineContext
+from app.ingestion.router import IngestionRouter
 
 router = APIRouter(prefix="/v1/ingest", tags=["Ingestion"])
+
+INGEST_AUDIT = AuditAction.ingest
 
 
 async def _run_pipeline(
     workspace_id: str,
-    sections: List[dict],
+    file_data: Optional[bytes],
+    content: Optional[str],
     filename: Optional[str],
     source_type: Optional[str],
     db: AsyncSession,
@@ -35,16 +36,56 @@ async def _run_pipeline(
     source_connector: Optional[str] = None,
     source_original_id: Optional[str] = None,
 ) -> dict:
-    bundle = BundleManager(settings.okf_bundle_root, workspace_id)
-    structurer = StructurerAgent(llm_client=llm)
-    linker = LinkerAgent(bundle, llm_client=llm)
+    orchestrator = PipelineOrchestrator(workspace_id, llm_client=llm)
+    pctx = PipelineContext()
 
+    pctx.ctx.update({
+        "workspace_id": workspace_id,
+        "file_data": file_data,
+        "filename": filename or "direct_input",
+        "mime_hint": source_type or "",
+        "source_connector": source_connector,
+        "source_original_id": source_original_id,
+    })
+
+    if content and not file_data:
+        pctx.ctx["raw_markdown"] = content
+        pctx.ctx["source_type"] = source_type or "text"
+
+    pctx = await orchestrator.run(pctx)
+
+    parse_result = pctx.results.get("parse")
+    chunk_result = pctx.results.get("chunk")
+    structure_result = pctx.results.get("structure")
+    link_result = pctx.results.get("link")
+    embed_result = pctx.results.get("embed")
+
+    if not structure_result or not structure_result.success:
+        return {
+            "status": "error",
+            "workspace_id": workspace_id,
+            "concepts_created": 0,
+            "duplicates_skipped": 0,
+            "pipeline_results": {
+                name: {"success": r.success, "error": r.error}
+                for name, r in pctx.results.items()
+            },
+        }
+
+    concepts = structure_result.data.get("concepts", [])
+    linked = link_result.data.get("linked_concepts", concepts) if link_result and link_result.success else concepts
+    link_map = link_result.data.get("link_map", []) if link_result and link_result.success else []
+    sections = chunk_result.data.get("sections", []) if chunk_result and chunk_result.success else []
+
+    bundle = BundleManager(settings.okf_bundle_root, workspace_id)
     written_paths = []
     concept_links = []
     duplicates_skipped = 0
 
-    for section in sections:
+    for i, concept in enumerate(linked):
+        section = sections[i] if i < len(sections) else {}
         section_hash = section.get("hash", "")
+
         if section_hash:
             existing = await db.execute(
                 select(Node).where(
@@ -56,19 +97,22 @@ async def _run_pipeline(
                 duplicates_skipped += 1
                 continue
 
-        concept = await structurer.generate_concept(section, base_path="ingested")
-        linked_concept, linked_paths = await linker.link_concept(concept)
+        bundle.write_concept(concept)
+        written_paths.append(concept.filepath)
 
-        bundle.write_concept(linked_concept)
-        written_paths.append(linked_concept.filepath)
-        concept_links.append((linked_concept.filepath, linked_paths))
+        linked_paths = []
+        for fp, paths in link_map:
+            if fp == concept.filepath:
+                linked_paths = paths
+                break
+        concept_links.append((concept.filepath, linked_paths))
 
         node = Node(
             workspace_id=workspace_id,
-            concept_path=linked_concept.filepath,
-            title=linked_concept.frontmatter.title or "",
-            node_type=linked_concept.frontmatter.type,
-            tags=linked_concept.frontmatter.tags or [],
+            concept_path=concept.filepath,
+            title=concept.frontmatter.title or "",
+            node_type=concept.frontmatter.type,
+            tags=concept.frontmatter.tags or [],
             status=NodeStatus.draft,
             source_hash=section_hash,
             source_connector=source_connector,
@@ -76,21 +120,22 @@ async def _run_pipeline(
             chunk_index=section.get("chunk_index"),
             parent_hash=section.get("parent_hash"),
             token_count=section.get("tokens_estimate"),
-            file_size=len(linked_concept.body),
-            body_text=linked_concept.body or "",
+            file_size=len(concept.body),
+            body_text=concept.body or "",
         )
         db.add(node)
 
-    total = len(sections)
+    total = len(sections) or len(linked)
     audit_details = {
         "filename": filename,
         "sections": total,
         "source_type": source_type,
         "duplicates_skipped": duplicates_skipped,
+        "vectors_indexed": embed_result.data.get("vectors_indexed", 0) if embed_result and embed_result.success else 0,
     }
     audit = AuditLog(
         workspace_id=workspace_id,
-        action=AuditAction.ingest,
+        action=INGEST_AUDIT,
         resource_type="document",
         details=audit_details,
     )
@@ -145,20 +190,21 @@ async def _run_pipeline(
         "workspace_id": workspace_id,
         "concepts_created": total - duplicates_skipped,
         "duplicates_skipped": duplicates_skipped,
+        "vectors_indexed": embed_result.data.get("vectors_indexed", 0) if embed_result and embed_result.success else 0,
     }
 
 
 async def _background_ingest(
     job_id: str,
     workspace_id: str,
-    sections: List[dict],
+    file_data: Optional[bytes],
+    content: Optional[str],
     filename: Optional[str],
     source_type: Optional[str],
     llm,
     source_connector: Optional[str] = None,
     source_original_id: Optional[str] = None,
 ):
-    """Run ingest pipeline in background, updating job status as we go."""
     factory = get_session_factory()
     async with factory() as db:
         try:
@@ -173,7 +219,8 @@ async def _background_ingest(
 
             result = await _run_pipeline(
                 workspace_id=workspace_id,
-                sections=sections,
+                file_data=file_data,
+                content=content,
                 filename=filename,
                 source_type=source_type,
                 db=db,
@@ -201,23 +248,6 @@ async def _background_ingest(
                 pass
 
 
-async def _prepare_sections_for_background(
-    content: str,
-    filename: Optional[str],
-    source_type: Optional[str],
-    llm,
-) -> List[dict]:
-    from app.ingestion.chunker import ChunkerAgent
-    ingestor = IngestorAgent(llm_client=llm)
-    sections = await ingestor.process(
-        content=content,
-        filename=filename,
-        source_type=source_type,
-    )
-    chunker = ChunkerAgent()
-    return chunker.chunk(sections)
-
-
 @router.post("", response_model=IngestJobCreateResponse)
 async def ingest_document(
     req: IngestionRequest,
@@ -241,18 +271,12 @@ async def ingest_document(
     await db.commit()
     await db.refresh(job)
 
-    sections = await _prepare_sections_for_background(
-        content=req.content,
-        filename=req.filename,
-        source_type=req.source_type,
-        llm=llm,
-    )
-
     background_tasks.add_task(
         _background_ingest,
         job_id=job.id,
         workspace_id=req.workspace_id,
-        sections=sections,
+        file_data=None,
+        content=req.content,
         filename=req.filename,
         source_type=req.source_type,
         llm=llm,
@@ -278,13 +302,14 @@ async def ingest_upload(
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
 
+    router_ingest = IngestionRouter()
     try:
         mime_hint = file.content_type or ""
-        parsed = parse_document(data, filename=file.filename or "", mime_hint=mime_hint)
+        parsed = router_ingest.route(data, filename=file.filename or "", mime_hint=mime_hint)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    content = "\n\n".join(s.text for s in parsed.sections)
+    content = parsed.raw_markdown
 
     job = IngestJob(
         id=new_uuid(),
@@ -297,18 +322,12 @@ async def ingest_upload(
     await db.commit()
     await db.refresh(job)
 
-    sections = await _prepare_sections_for_background(
-        content=content,
-        filename=file.filename,
-        source_type=parsed.source_type,
-        llm=llm,
-    )
-
     background_tasks.add_task(
         _background_ingest,
         job_id=job.id,
         workspace_id=workspace_id,
-        sections=sections,
+        file_data=data,
+        content=content,
         filename=file.filename,
         source_type=parsed.source_type,
         llm=llm,
@@ -420,18 +439,12 @@ async def retry_ingest_job(
             pass
     content = "\n\n".join(content_lines) if content_lines else ""
 
-    sections = await _prepare_sections_for_background(
-        content=content or "retry",
-        filename=job.filename,
-        source_type=job.source_type,
-        llm=llm,
-    )
-
     background_tasks.add_task(
         _background_ingest,
         job_id=new_job.id,
         workspace_id=job.workspace_id,
-        sections=sections,
+        file_data=None,
+        content=content or "retry",
         filename=job.filename,
         source_type=job.source_type,
         llm=llm,
@@ -464,18 +477,12 @@ async def _webhook_ingest(
         await db.commit()
         await db.refresh(job)
 
-        sections = await _prepare_sections_for_background(
-            content=content,
-            filename=filename,
-            source_type=parsed.source_type,
-            llm=llm,
-        )
-
         background_tasks.add_task(
             _background_ingest,
             job_id=job.id,
             workspace_id=workspace_id,
-            sections=sections,
+            file_data=None,
+            content=content,
             filename=filename,
             source_type=parsed.source_type,
             llm=llm,
@@ -559,4 +566,3 @@ async def generic_webhook(
 
     await _webhook_ingest(workspace_id, docs, "generic_webhook", background_tasks, db, llm)
     return {"status": "ok", "ingested": len(docs)}
-
