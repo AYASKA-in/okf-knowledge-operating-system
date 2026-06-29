@@ -680,7 +680,9 @@ class TestIngestEndpoint:
                                        "content": "# Intro\n\nText.\n\n# Details\n\nMore.",
                                        "source_type": "markdown"})
         assert resp.status_code == 200
-        assert resp.json()["status"] == "ok"
+        data = resp.json()
+        assert "job_id" in data
+        assert data["status"] == "pending"
 
     @pytest.mark.asyncio
     async def test_ingest_upload_html(self, test_db, seed_data):
@@ -693,10 +695,8 @@ class TestIngestEndpoint:
             )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "ok"
-        assert data["filename"] == "test.html"
-        assert data["source_type"] == "html"
-        assert data["concepts_created"] >= 1
+        assert "job_id" in data
+        assert data["status"] == "pending"
 
     @pytest.mark.asyncio
     async def test_ingest_upload_unsupported(self, test_db, seed_data):
@@ -708,6 +708,68 @@ class TestIngestEndpoint:
             )
         assert resp.status_code == 400
         assert "Unsupported" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_ingest_upload_empty(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/v1/ingest/upload?workspace_id=test-ws-1",
+                headers={"Authorization": f"Bearer {seed_data['token']}"},
+                files={"file": ("empty.txt", b"", "text/plain")},
+            )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_ingest_job_poll(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            create = await c.post("/v1/ingest",
+                                 headers={"Authorization": f"Bearer {seed_data['token']}"},
+                                 json={"workspace_id": "test-ws-1", "filename": "poll.md",
+                                        "content": "# Poll\n\nTest job polling.", "source_type": "text"})
+        job_id = create.json()["job_id"]
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.get(f"/v1/ingest/jobs/{job_id}",
+                               headers={"Authorization": f"Bearer {seed_data['token']}"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["id"] == job_id
+        assert data["status"] in ("pending", "running", "done", "failed")
+
+    @pytest.mark.asyncio
+    async def test_ingest_job_list(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/v1/ingest",
+                         headers={"Authorization": f"Bearer {seed_data['token']}"},
+                         json={"workspace_id": "test-ws-1", "filename": "list1.md",
+                                "content": "# List1\n\nContent.", "source_type": "text"})
+            await c.post("/v1/ingest",
+                         headers={"Authorization": f"Bearer {seed_data['token']}"},
+                         json={"workspace_id": "test-ws-1", "filename": "list2.md",
+                                "content": "# List2\n\nMore content.", "source_type": "text"})
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.get("/v1/ingest/jobs?workspace_id=test-ws-1",
+                               headers={"Authorization": f"Bearer {seed_data['token']}"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) >= 2
+        assert all(j["workspace_id"] == "test-ws-1" for j in data)
+
+    @pytest.mark.asyncio
+    async def test_ingest_job_not_found(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.get("/v1/ingest/jobs/nonexistent-job-id",
+                               headers={"Authorization": f"Bearer {seed_data['token']}"})
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_ingest_job_list_no_workspace(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.get("/v1/ingest/jobs?workspace_id=nonexistent",
+                               headers={"Authorization": f"Bearer {seed_data['token']}"})
+        assert resp.status_code == 200
+        assert resp.json() == []
 
     @pytest.mark.asyncio
     async def test_ingest_upload_empty(self, test_db, seed_data):

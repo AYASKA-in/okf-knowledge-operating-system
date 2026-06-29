@@ -12,6 +12,25 @@ class IngestionUploadResponse(BaseModel):
     sections: int
 
 
+class IngestJobResponse(BaseModel):
+    id: str
+    workspace_id: str
+    filename: str
+    source_type: str
+    status: str
+    progress_pct: int
+    error_message: str
+    result_summary: dict
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None
+
+
+class IngestJobCreateResponse(BaseModel):
+    job_id: str
+    status: str
+
+
 class ConceptCreate(BaseModel):
     type: str
     title: Optional[str] = None

@@ -42,6 +42,13 @@ class EdgeType(str, enum.Enum):
     related_to = "related_to"
 
 
+class IngestJobStatus(str, enum.Enum):
+    pending = "pending"
+    running = "running"
+    done = "done"
+    failed = "failed"
+
+
 class AuditAction(str, enum.Enum):
     ingest = "ingest"
     query = "query"
@@ -138,6 +145,27 @@ class Edge(Base):
 
     source = relationship("Node", foreign_keys=[source_id], back_populates="edges_out")
     target = relationship("Node", foreign_keys=[target_id], back_populates="edges_in")
+
+
+class IngestJob(Base):
+    __tablename__ = "ingest_jobs"
+    __table_args__ = (
+        Index("ix_ingest_jobs_workspace_id", "workspace_id"),
+        Index("ix_ingest_jobs_status", "workspace_id", "status"),
+        Index("ix_ingest_jobs_created_at", "workspace_id", "created_at"),
+    )
+
+    id = Column(String, primary_key=True, default=new_uuid)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    filename = Column(String(512), default="")
+    source_type = Column(String(50), default="")
+    status = Column(Enum(IngestJobStatus), default=IngestJobStatus.pending)
+    progress_pct = Column(Integer, default=0)
+    error_message = Column(Text, default="")
+    result_summary = Column(JSON, default=dict)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class AuditLog(Base):
