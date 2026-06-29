@@ -50,7 +50,6 @@ class IngestJobStatus(str, enum.Enum):
 
 
 class AuditAction(str, enum.Enum):
-    ingest = "ingest"
     query = "query"
     chat = "chat"
     approve = "approve"
@@ -114,6 +113,11 @@ class Node(Base):
     tags = Column(StringArray(), default=list)
     status = Column(Enum(NodeStatus), default=NodeStatus.draft)
     source_hash = Column(String(64), default="")
+    source_connector = Column(String(50), nullable=True)
+    source_original_id = Column(String(255), nullable=True)
+    chunk_index = Column(Integer, nullable=True)
+    parent_hash = Column(String(64), nullable=True)
+    token_count = Column(Integer, nullable=True)
     file_size = Column(Integer, default=0)
     body_text = Column(Text, default="")
     created_at = Column(DateTime(timezone=True), default=utcnow)
@@ -166,6 +170,53 @@ class IngestJob(Base):
     created_at = Column(DateTime(timezone=True), default=utcnow)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ExportJobStatus(str, enum.Enum):
+    pending = "pending"
+    running = "running"
+    done = "done"
+    failed = "failed"
+
+
+class ExportJob(Base):
+    __tablename__ = "export_jobs"
+    __table_args__ = (
+        Index("ix_export_jobs_workspace_id", "workspace_id"),
+        Index("ix_export_jobs_status", "workspace_id", "status"),
+        Index("ix_export_jobs_created_at", "workspace_id", "created_at"),
+    )
+
+    id = Column(String, primary_key=True, default=new_uuid)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    status = Column(Enum(ExportJobStatus), default=ExportJobStatus.pending)
+    format = Column(String(20), default="zip")
+    filename = Column(String(512), default="")
+    file_size = Column(Integer, default=0)
+    file_path = Column(String(1024), default="")
+    error_message = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ConnectorConfig(Base):
+    __tablename__ = "connector_configs"
+    __table_args__ = (
+        Index("ix_connector_configs_workspace_id", "workspace_id"),
+        UniqueConstraint("workspace_id", "connector_type", name="uq_connector_workspace_type"),
+    )
+
+    id = Column(String, primary_key=True, default=new_uuid)
+    workspace_id = Column(String, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    connector_type = Column(String(50), nullable=False)
+    label = Column(String(255), default="")
+    config = Column(JSON, default=dict)
+    is_active = Column(Boolean, default=True)
+    last_status = Column(String(100), default="")
+    last_polled_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
 class AuditLog(Base):

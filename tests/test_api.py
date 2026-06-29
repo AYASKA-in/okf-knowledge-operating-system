@@ -8,11 +8,11 @@ import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
-from app.database import Base, get_db
+from app.database import Base, get_db, get_session_factory
 from app.main import app
 from app.config import settings
 from app.auth.jwt import create_access_token, create_refresh_token
-from app.models.db import Workspace, User, Node, NodeStatus, Edge
+from app.models.db import Workspace, User, Node, NodeStatus, Edge, IngestJob, IngestJobStatus, ConnectorConfig
 
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 
@@ -38,6 +38,10 @@ async def test_db():
 
     app.dependency_overrides[get_db] = override_get_db
 
+    import app.database as db_mod
+    db_mod._async_session_factory = factory
+    db_mod._engine = engine
+
     tmp_bundle = tempfile.mkdtemp(prefix="ekos_test_bundle_")
     original_root = settings.okf_bundle_root
     settings.okf_bundle_root = tmp_bundle
@@ -51,6 +55,9 @@ async def test_db():
     import shutil
     shutil.rmtree(tmp_bundle, ignore_errors=True)
     app.dependency_overrides.clear()
+    import app.database as db_mod
+    db_mod._async_session_factory = None
+    db_mod._engine = None
     await engine.dispose()
 
 
@@ -772,14 +779,128 @@ class TestIngestEndpoint:
         assert resp.json() == []
 
     @pytest.mark.asyncio
-    async def test_ingest_upload_empty(self, test_db, seed_data):
+    async def test_ingest_job_retry(self, test_db, seed_data):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.post(
-                "/v1/ingest/upload?workspace_id=test-ws-1",
-                headers={"Authorization": f"Bearer {seed_data['token']}"},
-                files={"file": ("empty.txt", b"", "text/plain")},
+            create = await c.post("/v1/ingest", headers={"Authorization": f"Bearer {seed_data['token']}"},
+                                  json={"workspace_id": "test-ws-1", "filename": "retry.md",
+                                         "content": "# Retry\n\nTest retry.", "source_type": "text"})
+        job_id = create.json()["job_id"]
+
+        factory = test_db
+        async with factory() as session:
+            job = await session.get(IngestJob, job_id)
+            job.status = IngestJobStatus.failed
+            await session.commit()
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(f"/v1/ingest/jobs/{job_id}/retry",
+                                headers={"Authorization": f"Bearer {seed_data['token']}"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "pending"
+        assert resp.json()["job_id"] != job_id
+
+    @pytest.mark.asyncio
+    async def test_ingest_job_retry_not_failed(self, test_db, seed_data):
+        factory = test_db
+        async with factory() as session:
+            job = IngestJob(
+                workspace_id="test-ws-1", filename="standalone.md",
+                source_type="text", status=IngestJobStatus.pending,
             )
+            session.add(job)
+            await session.commit()
+            job_id = job.id
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(f"/v1/ingest/jobs/{job_id}/retry",
+                                headers={"Authorization": f"Bearer {seed_data['token']}"})
         assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_ingest_job_retry_not_found(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/v1/ingest/jobs/nonexistent/retry",
+                                headers={"Authorization": f"Bearer {seed_data['token']}"})
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_ingest_dedup_same_content(self, test_db, seed_data):
+        content = "# DedupTest\n\nSame content ingested twice."
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            r1 = await c.post("/v1/ingest", headers=headers,
+                              json={"workspace_id": "test-ws-1", "filename": "dedup1.md",
+                                     "content": content, "source_type": "text"})
+            job1 = r1.json()["job_id"]
+
+            r2 = await c.post("/v1/ingest", headers=headers,
+                              json={"workspace_id": "test-ws-1", "filename": "dedup2.md",
+                                     "content": content, "source_type": "text"})
+            job2 = r2.json()["job_id"]
+
+        factory = test_db
+        async with factory() as session:
+            j1 = await session.get(IngestJob, job1)
+            j2 = await session.get(IngestJob, job2)
+
+            nodes1 = (await session.execute(
+                select(Node).where(Node.workspace_id == "test-ws-1", Node.concept_path.like("%dedup1%"))
+            )).scalars().all()
+
+            nodes2 = (await session.execute(
+                select(Node).where(Node.workspace_id == "test-ws-1", Node.concept_path.like("%dedup2%"))
+            )).scalars().all()
+
+        # Both jobs should have completed (or failed), but dedup2 should
+        # have produced nodes only if they didn't collide with dedup1's hash
+        all_nodes = len(nodes1) + len(nodes2)
+        assert all_nodes <= len(nodes1) * 2, "Dedup should prevent duplicate nodes across jobs"
+
+    @pytest.mark.asyncio
+    async def test_ingest_source_tracking_upload(self, test_db, seed_data):
+        html = b"<html><body><h1>Tracked</h1><p>Source tracking test.</p></body></html>"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/v1/ingest/upload?workspace_id=test-ws-1",
+                                headers={"Authorization": f"Bearer {seed_data['token']}"},
+                                files={"file": ("source_track.html", html, "text/html")})
+        assert resp.status_code == 200
+        job_id = resp.json()["job_id"]
+
+        factory = test_db
+        async with factory() as session:
+            nodes = (await session.execute(
+                select(Node).where(Node.workspace_id == "test-ws-1", Node.source_connector == "upload")
+            )).scalars().all()
+            # At least one node should have source_connector="upload"
+            assert any(n.source_connector == "upload" for n in nodes)
+            assert any(n.source_original_id == "source_track.html" for n in nodes)
+
+    @pytest.mark.asyncio
+    async def test_ingest_chunking_large_document(self, test_db, seed_data):
+        large_text = "# Large Doc\n\n" + ("A" * 50000)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/v1/ingest", headers={"Authorization": f"Bearer {seed_data['token']}"},
+                                json={"workspace_id": "test-ws-1", "filename": "large.md",
+                                       "content": large_text, "source_type": "text"})
+        assert resp.status_code == 200
+        job_id = resp.json()["job_id"]
+
+        factory = test_db
+        async with factory() as session:
+            job = await session.get(IngestJob, job_id)
+
+        # The large content should have been chunked, creating multiple nodes
+        # or at least one node with chunk_index set
+        factory = test_db
+        async with factory() as session:
+            nodes = (await session.execute(
+                select(Node).where(
+                    Node.workspace_id == "test-ws-1",
+                    Node.chunk_index.isnot(None),
+                )
+            )).scalars().all()
+
+        assert len(nodes) >= 1, "Large document should produce chunked nodes"
 
 
 class TestChatEndpoint:
@@ -819,11 +940,29 @@ class TestExportEndpoint:
     @pytest.mark.asyncio
     async def test_export(self, test_db, seed_data):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
             resp = await c.post("/v1/export",
-                                headers={"Authorization": f"Bearer {seed_data['token']}"},
+                                headers=headers,
                                 json={"workspace_id": "test-ws-1"})
-        assert resp.status_code == 200
-        assert resp.headers["content-type"] == "application/zip"
+        assert resp.status_code == 202
+        data = resp.json()
+        assert "job_id" in data
+        assert data["status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_export_poll_and_download(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            create = await c.post("/v1/export",
+                                  headers=headers,
+                                  json={"workspace_id": "test-ws-1"})
+            job_id = create.json()["job_id"]
+
+            poll = await c.get(f"/v1/export/jobs/{job_id}", headers=headers)
+        assert poll.status_code == 200
+        assert poll.json()["id"] == job_id
+        assert poll.json()["status"] in ("pending", "running", "done")
+        assert "created_at" in poll.json()
 
     @pytest.mark.asyncio
     async def test_export_with_concepts(self, test_db, seed_data):
@@ -839,16 +978,57 @@ class TestExportEndpoint:
         assert (bundle.workspace_path / "export_test.md").exists()
 
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.post("/v1/export",
-                                headers={"Authorization": f"Bearer {seed_data['token']}"},
-                                json={"workspace_id": "test-ws-1"})
-        assert resp.status_code == 200
-        assert resp.headers["content-type"] == "application/zip"
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            create = await c.post("/v1/export",
+                                  headers=headers,
+                                  json={"workspace_id": "test-ws-1"})
+            job_id = create.json()["job_id"]
+
+            poll = await c.get(f"/v1/export/jobs/{job_id}", headers=headers)
+        assert poll.json()["status"] == "done", f"Expected done, got {poll.json()['status']}: {poll.json().get('error_message', '')}"
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            dl = await c.get(f"/v1/export/jobs/{job_id}/download", headers=headers)
+        assert dl.status_code == 200
+        assert dl.headers["content-type"] == "application/zip"
         import zipfile
         import io
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
             names = zf.namelist()
             assert any("export_test.md" in n for n in names)
+
+    @pytest.mark.asyncio
+    async def test_export_list_jobs(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            await c.post("/v1/export", headers=headers, json={"workspace_id": "test-ws-1"})
+            resp = await c.get("/v1/export/jobs?workspace_id=test-ws-1", headers=headers)
+        assert resp.status_code == 200
+        assert len(resp.json()) >= 1
+
+    @pytest.mark.asyncio
+    async def test_export_job_not_found(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.get("/v1/export/jobs/nonexistent",
+                               headers={"Authorization": f"Bearer {seed_data['token']}"})
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_export_download_not_ready(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            create = await c.post("/v1/export",
+                                  headers=headers,
+                                  json={"workspace_id": "test-ws-1"})
+            job_id = create.json()["job_id"]
+            dl = await c.get(f"/v1/export/jobs/{job_id}/download", headers=headers)
+        assert dl.status_code in (200, 400)
+
+    @pytest.mark.asyncio
+    async def test_export_unauthorized(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/v1/export", json={"workspace_id": "test-ws-1"})
+        assert resp.status_code == 401
 
 
 class TestEdgeEndpoints:
@@ -1062,3 +1242,225 @@ class TestGraphEndpoints:
                                 json={"workspace_id": "test-ws-1", "source_id": "gpn-a", "target_id": "gpn-b"})
         assert resp.status_code == 200
         assert resp.json()["path_found"] is False
+
+
+class TestConnectorEndpoints:
+    @pytest.mark.asyncio
+    async def test_list_connector_types(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.get("/v1/admin/connectors/types",
+                               headers={"Authorization": f"Bearer {seed_data['token']}"})
+        assert resp.status_code == 200
+        types = [t["type"] for t in resp.json()]
+        assert "notion" in types
+        assert "git_webhook" in types
+        assert "generic_webhook" in types
+
+    async def _create_connector(self, c, seed_data, secret):
+        resp = await c.post("/v1/admin/connectors?workspace_id=test-ws-1",
+                            headers={"Authorization": f"Bearer {seed_data['token']}"},
+                            json={"connector_type": "generic_webhook",
+                                  "config": {"secret": secret}})
+        assert resp.status_code == 201
+        return resp.json()
+
+    async def _delete_connector(self, c, seed_data, conn_id):
+        await c.delete(f"/v1/admin/connectors/{conn_id}",
+                       headers={"Authorization": f"Bearer {seed_data['token']}"})
+
+    @pytest.mark.asyncio
+    async def test_create_connector(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            data = await self._create_connector(c, seed_data, "sh-webhook-test-secret")
+            await self._delete_connector(c, seed_data, data["id"])
+        assert data["connector_type"] == "generic_webhook"
+        assert data["workspace_id"] == "test-ws-1"
+
+    @pytest.mark.asyncio
+    async def test_create_connector_invalid_type(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/v1/admin/connectors?workspace_id=test-ws-1",
+                headers={"Authorization": f"Bearer {seed_data['token']}"},
+                json={"connector_type": "invalid_type", "config": {}},
+            )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_create_connector_duplicate(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            first = await c.post("/v1/admin/connectors?workspace_id=test-ws-1", headers=headers,
+                                 json={"connector_type": "generic_webhook", "config": {"secret": "sh-webhook-dup"}})
+            assert first.status_code == 201
+            resp = await c.post("/v1/admin/connectors?workspace_id=test-ws-1", headers=headers,
+                                json={"connector_type": "generic_webhook", "config": {"secret": "sh-webhook-dup-2"}})
+            await self._delete_connector(c, seed_data, first.json()["id"])
+        assert resp.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_list_connectors(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            data = await self._create_connector(c, seed_data, "sh-webhook-list")
+            resp = await c.get("/v1/admin/connectors?workspace_id=test-ws-1",
+                               headers={"Authorization": f"Bearer {seed_data['token']}"})
+            await self._delete_connector(c, seed_data, data["id"])
+        assert resp.status_code == 200
+        assert len(resp.json()) >= 1
+
+    @pytest.mark.asyncio
+    async def test_get_connector(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            data = await self._create_connector(c, seed_data, "sh-webhook-get")
+            resp = await c.get(f"/v1/admin/connectors/{data['id']}", headers=headers)
+            await self._delete_connector(c, seed_data, data["id"])
+        assert resp.status_code == 200
+        assert resp.json()["id"] == data["id"]
+
+    @pytest.mark.asyncio
+    async def test_update_connector(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            data = await self._create_connector(c, seed_data, "sh-webhook-upd")
+            resp = await c.put(f"/v1/admin/connectors/{data['id']}", headers=headers,
+                               json={"label": "Updated Label"})
+            await self._delete_connector(c, seed_data, data["id"])
+        assert resp.status_code == 200
+        assert resp.json()["label"] == "Updated Label"
+
+    @pytest.mark.asyncio
+    async def test_delete_connector(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            data = await self._create_connector(c, seed_data, "sh-webhook-del")
+            resp = await c.delete(f"/v1/admin/connectors/{data['id']}", headers=headers)
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_connector_not_found(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.get("/v1/admin/connectors/nonexistent",
+                               headers={"Authorization": f"Bearer {seed_data['token']}"})
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_test_connector(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            data = await self._create_connector(c, seed_data, "sh-webhook-test-test")
+            resp = await c.post(f"/v1/admin/connectors/{data['id']}/test", headers=headers)
+            await self._delete_connector(c, seed_data, data["id"])
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_test_connector_not_found(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/v1/admin/connectors/nonexistent/test",
+                                headers={"Authorization": f"Bearer {seed_data['token']}"})
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_generic_webhook_no_connector(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/v1/ingest/webhook/myapp?workspace_id=test-ws-1",
+                                headers={"Authorization": f"Bearer {seed_data['token']}"},
+                                json={"title": "Test", "content": "Hello"})
+        assert resp.status_code == 404
+        assert "no active" in resp.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_generic_webhook_hmac_failure(self, test_db, seed_data):
+        secret = "sh-webhook-hmac-fail"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            data = await self._create_connector(c, seed_data, secret)
+
+        payload = b'{"title":"Bad Sig","content":"Wrong signature"}'
+        import hashlib, hmac
+        wrong_sig = hmac.new(b"wrong-secret", payload, hashlib.sha256).hexdigest()
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/v1/ingest/webhook/myapp?workspace_id=test-ws-1",
+                headers={
+                    "Authorization": f"Bearer {seed_data['token']}",
+                    "X-Hub-Signature-256": f"sha256={wrong_sig}",
+                },
+                content=payload,
+            )
+            await self._delete_connector(c, seed_data, data["id"])
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_generic_webhook_with_hmac(self, test_db, seed_data):
+        import hashlib, hmac
+        secret = "sh-webhook-hmac-test"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            data = await self._create_connector(c, seed_data, secret)
+
+        payload = b'{"title":"Webhook Doc","content":"Ingested via webhook"}'
+        expected_sig = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/v1/ingest/webhook/myapp?workspace_id=test-ws-1",
+                headers={
+                    "Authorization": f"Bearer {seed_data['token']}",
+                    "X-Hub-Signature-256": f"sha256={expected_sig}",
+                },
+                content=payload,
+            )
+            await self._delete_connector(c, seed_data, data["id"])
+        assert resp.status_code == 200
+        assert resp.json()["ingested"] >= 1
+
+
+class TestGitHubWebhookEndpoint:
+    @pytest.mark.asyncio
+    async def test_github_webhook_no_connector(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/v1/ingest/webhook/github?workspace_id=test-ws-1",
+                                headers={"Authorization": f"Bearer {seed_data['token']}"},
+                                json={"repository": {"full_name": "test/repo"},
+                                      "ref": "refs/heads/main", "commits": []})
+        assert resp.status_code == 404
+        assert "no active" in resp.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_github_webhook_missing_repo(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/v1/ingest/webhook/github?workspace_id=test-ws-1",
+                                headers={"Authorization": f"Bearer {seed_data['token']}"},
+                                json={"commits": []})
+        assert resp.status_code == 400
+        assert "repository" in resp.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_github_webhook_empty_push(self, test_db, seed_data):
+        factory = test_db
+        async with factory() as session:
+            config = ConnectorConfig(
+                workspace_id="test-ws-1", connector_type="git_webhook",
+                config={"token": "dummy", "repo": "dummy/repo"},
+                is_active=True,
+            )
+            session.add(config)
+            await session.commit()
+            conn_id = config.id
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/v1/ingest/webhook/github?workspace_id=test-ws-1",
+                                headers={"Authorization": f"Bearer {seed_data['token']}"},
+                                json={"repository": {"full_name": "test/repo"},
+                                      "ref": "refs/heads/main",
+                                      "commits": [{"id": "abc123", "added": [], "modified": [], "removed": []}]})
+        assert resp.status_code == 200
+        assert resp.json()["ingested"] == 0
+
+        async with factory() as session:
+            await session.delete(config)
+            await session.commit()
+

@@ -3,7 +3,7 @@ from sqlalchemy import engine_from_config, pool
 from alembic import context
 
 from app.database import Base
-from app.models.db import Workspace, User, Node, Edge, AuditLog, IngestJob
+from app.models.db import Workspace, User, Node, Edge, AuditLog, IngestJob, ExportJob, ConnectorConfig
 
 config = context.config
 if config.config_file_name is not None:

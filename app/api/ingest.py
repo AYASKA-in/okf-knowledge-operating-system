@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, BackgroundTasks, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import List, Optional
@@ -11,7 +11,7 @@ from app.models.schemas import (
 )
 from app.models.db import (
     Workspace, Node, Edge, EdgeType, NodeStatus, AuditLog, AuditAction,
-    IngestJob, IngestJobStatus, new_uuid,
+    IngestJob, IngestJobStatus, ConnectorConfig, new_uuid,
 )
 from app.agents.ingestor import IngestorAgent
 from app.agents.structurer import StructurerAgent
@@ -32,6 +32,8 @@ async def _run_pipeline(
     source_type: Optional[str],
     db: AsyncSession,
     llm,
+    source_connector: Optional[str] = None,
+    source_original_id: Optional[str] = None,
 ) -> dict:
     bundle = BundleManager(settings.okf_bundle_root, workspace_id)
     structurer = StructurerAgent(llm_client=llm)
@@ -39,8 +41,21 @@ async def _run_pipeline(
 
     written_paths = []
     concept_links = []
+    duplicates_skipped = 0
 
     for section in sections:
+        section_hash = section.get("hash", "")
+        if section_hash:
+            existing = await db.execute(
+                select(Node).where(
+                    Node.workspace_id == workspace_id,
+                    Node.source_hash == section_hash,
+                ).limit(1)
+            )
+            if existing.scalar_one_or_none():
+                duplicates_skipped += 1
+                continue
+
         concept = await structurer.generate_concept(section, base_path="ingested")
         linked_concept, linked_paths = await linker.link_concept(concept)
 
@@ -55,21 +70,29 @@ async def _run_pipeline(
             node_type=linked_concept.frontmatter.type,
             tags=linked_concept.frontmatter.tags or [],
             status=NodeStatus.draft,
-            source_hash=section.get("hash", ""),
+            source_hash=section_hash,
+            source_connector=source_connector,
+            source_original_id=source_original_id,
+            chunk_index=section.get("chunk_index"),
+            parent_hash=section.get("parent_hash"),
+            token_count=section.get("tokens_estimate"),
             file_size=len(linked_concept.body),
             body_text=linked_concept.body or "",
         )
         db.add(node)
 
+    total = len(sections)
+    audit_details = {
+        "filename": filename,
+        "sections": total,
+        "source_type": source_type,
+        "duplicates_skipped": duplicates_skipped,
+    }
     audit = AuditLog(
         workspace_id=workspace_id,
         action=AuditAction.ingest,
         resource_type="document",
-        details={
-            "filename": filename,
-            "sections": len(sections),
-            "source_type": source_type,
-        },
+        details=audit_details,
     )
     db.add(audit)
 
@@ -120,7 +143,8 @@ async def _run_pipeline(
     return {
         "status": "ok",
         "workspace_id": workspace_id,
-        "concepts_created": len(sections),
+        "concepts_created": total - duplicates_skipped,
+        "duplicates_skipped": duplicates_skipped,
     }
 
 
@@ -131,6 +155,8 @@ async def _background_ingest(
     filename: Optional[str],
     source_type: Optional[str],
     llm,
+    source_connector: Optional[str] = None,
+    source_original_id: Optional[str] = None,
 ):
     """Run ingest pipeline in background, updating job status as we go."""
     factory = get_session_factory()
@@ -152,6 +178,8 @@ async def _background_ingest(
                 source_type=source_type,
                 db=db,
                 llm=llm,
+                source_connector=source_connector,
+                source_original_id=source_original_id,
             )
 
             job.status = IngestJobStatus.done
@@ -173,23 +201,21 @@ async def _background_ingest(
                 pass
 
 
-def _sections_from_content(content: str, filename: Optional[str], source_type: Optional[str], llm) -> List[dict]:
-    """Synchronous wrapper — actually runs async via the callers."""
-    raise RuntimeError("Use _prepare_sections_for_background instead")
-
-
 async def _prepare_sections_for_background(
     content: str,
     filename: Optional[str],
     source_type: Optional[str],
     llm,
 ) -> List[dict]:
+    from app.ingestion.chunker import ChunkerAgent
     ingestor = IngestorAgent(llm_client=llm)
-    return await ingestor.process(
+    sections = await ingestor.process(
         content=content,
         filename=filename,
         source_type=source_type,
     )
+    chunker = ChunkerAgent()
+    return chunker.chunk(sections)
 
 
 @router.post("", response_model=IngestJobCreateResponse)
@@ -286,6 +312,8 @@ async def ingest_upload(
         filename=file.filename,
         source_type=parsed.source_type,
         llm=llm,
+        source_connector="upload",
+        source_original_id=file.filename,
     )
 
     return IngestJobCreateResponse(job_id=job.id, status=job.status.value)
@@ -410,3 +438,125 @@ async def retry_ingest_job(
     )
 
     return IngestJobCreateResponse(job_id=new_job.id, status=new_job.status.value)
+
+
+async def _webhook_ingest(
+    workspace_id: str,
+    docs: list,
+    connector_type: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession,
+    llm,
+):
+    for parsed in docs:
+        content = "\n\n".join(s.text for s in parsed.sections)
+        filename = parsed.title + ".md"
+        source_original_id = parsed.metadata.get("filepath") or parsed.metadata.get("source") or parsed.title
+
+        job = IngestJob(
+            id=new_uuid(),
+            workspace_id=workspace_id,
+            filename=filename,
+            source_type=parsed.source_type,
+            status=IngestJobStatus.pending,
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+
+        sections = await _prepare_sections_for_background(
+            content=content,
+            filename=filename,
+            source_type=parsed.source_type,
+            llm=llm,
+        )
+
+        background_tasks.add_task(
+            _background_ingest,
+            job_id=job.id,
+            workspace_id=workspace_id,
+            sections=sections,
+            filename=filename,
+            source_type=parsed.source_type,
+            llm=llm,
+            source_connector=connector_type,
+            source_original_id=source_original_id,
+        )
+
+
+@router.post("/webhook/github")
+async def github_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    workspace_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_role(["admin", "editor"])),
+    llm=Depends(get_llm_client),
+):
+    payload = await request.json()
+
+    repo_full_name = payload.get("repository", {}).get("full_name", "")
+    if not repo_full_name:
+        raise HTTPException(status_code=400, detail="Missing repository full_name in payload")
+
+    result = await db.execute(
+        select(ConnectorConfig).where(
+            ConnectorConfig.workspace_id == workspace_id,
+            ConnectorConfig.connector_type == "git_webhook",
+            ConnectorConfig.is_active == True,
+        )
+    )
+    config_row = result.scalar_one_or_none()
+    if not config_row:
+        raise HTTPException(status_code=404, detail="No active git_webhook connector configured for this workspace")
+
+    from app.ingestion.connectors.git_webhook import GitWebhookConnector
+    connector = GitWebhookConnector()
+    docs = await connector.process_push(config_row.config, payload)
+
+    if not docs:
+        return {"status": "ok", "ingested": 0, "message": "No new markdown files changed"}
+
+    await _webhook_ingest(workspace_id, docs, "git_webhook", background_tasks, db, llm)
+    return {"status": "ok", "ingested": len(docs)}
+
+
+@router.post("/webhook/{source_key}")
+async def generic_webhook(
+    source_key: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    workspace_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_role(["admin", "editor"])),
+    llm=Depends(get_llm_client),
+):
+    result = await db.execute(
+        select(ConnectorConfig).where(
+            ConnectorConfig.workspace_id == workspace_id,
+            ConnectorConfig.connector_type == "generic_webhook",
+            ConnectorConfig.is_active == True,
+        )
+    )
+    config_row = result.scalar_one_or_none()
+    if not config_row:
+        raise HTTPException(status_code=404, detail="No active generic_webhook connector configured for this workspace")
+
+    payload = await request.json()
+    raw_bytes = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+
+    from app.ingestion.connectors.generic_webhook import GenericWebhookConnector
+    connector = GenericWebhookConnector()
+
+    try:
+        docs = await connector.process_payload(config_row.config, payload, raw_bytes, signature)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    if not docs:
+        return {"status": "ok", "ingested": 0}
+
+    await _webhook_ingest(workspace_id, docs, "generic_webhook", background_tasks, db, llm)
+    return {"status": "ok", "ingested": len(docs)}
+

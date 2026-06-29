@@ -118,6 +118,24 @@ class ExportRequest(BaseModel):
     format: str = "zip"
 
 
+class ExportCreateResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+class ExportJobResponse(BaseModel):
+    id: str
+    workspace_id: str
+    status: str
+    format: str
+    filename: str
+    file_size: int
+    error_message: str
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None
+
+
 class WorkspaceCreate(BaseModel):
     name: str
     description: Optional[str] = None
@@ -229,3 +247,32 @@ class TokenData(BaseModel):
     workspace_id: str
     role: str
     attributes: Dict[str, Any] = {}
+
+
+class ConnectorConfigCreate(BaseModel):
+    connector_type: str
+    label: Optional[str] = ""
+    config: Dict[str, Any] = {}
+
+
+class ConnectorConfigUpdate(BaseModel):
+    label: Optional[str] = None
+    config: Optional[Dict[str, Any]] = None
+    is_active: Optional[bool] = None
+
+
+class ConnectorConfigResponse(BaseModel):
+    id: str
+    workspace_id: str
+    connector_type: str
+    label: str
+    is_active: bool
+    last_status: str
+    last_polled_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ConnectorTypeInfo(BaseModel):
+    type: str
+    label: str
