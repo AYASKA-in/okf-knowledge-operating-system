@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from app.config import settings
 from app.database import init_db
-from app.api import ingest, knowledge, chat, export, admin, auth, search, edges
+from app.api import ingest, knowledge, chat, export, admin, auth, search, edges, graph
 
 
 @asynccontextmanager
@@ -36,6 +36,7 @@ app.include_router(chat.router)
 app.include_router(export.router)
 app.include_router(admin.router)
 app.include_router(edges.router)
+app.include_router(graph.router)
 
 
 @app.get("/health")

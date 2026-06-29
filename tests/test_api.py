@@ -858,3 +858,108 @@ class TestEdgeEndpoints:
             resp = await c.delete("/v1/edges/nonexistent",
                                   headers={"Authorization": f"Bearer {seed_data['token']}"})
         assert resp.status_code == 404
+
+
+class TestGraphEndpoints:
+    @pytest.mark.asyncio
+    async def test_subgraph_basic(self, test_db, seed_data):
+        factory = test_db
+        async with factory() as session:
+            a = Node(id="graph-a", workspace_id="test-ws-1", concept_path="a.md",
+                      title="Node A", node_type="concept", tags=[], status=NodeStatus.draft)
+            b = Node(id="graph-b", workspace_id="test-ws-1", concept_path="b.md",
+                      title="Node B", node_type="concept", tags=[], status=NodeStatus.draft)
+            c = Node(id="graph-c", workspace_id="test-ws-1", concept_path="c.md",
+                      title="Node C", node_type="concept", tags=[], status=NodeStatus.draft)
+            session.add_all([a, b, c])
+            e1 = Edge(id="ge1", workspace_id="test-ws-1", source_id="graph-a", target_id="graph-b", edge_type="references")
+            e2 = Edge(id="ge2", workspace_id="test-ws-1", source_id="graph-b", target_id="graph-c", edge_type="depends_on")
+            session.add_all([e1, e2])
+            await session.commit()
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            resp = await c.get("/v1/knowledge/graph-a/graph?workspace_id=test-ws-1&depth=1", headers=headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["nodes"]) == 2
+        assert len(data["edges"]) == 1
+        assert data["edges"][0]["type"] == "references"
+
+    @pytest.mark.asyncio
+    async def test_subgraph_depth2(self, test_db, seed_data):
+        factory = test_db
+        async with factory() as session:
+            a = Node(id="gd2-a", workspace_id="test-ws-1", concept_path="d2_a.md",
+                      title="A", node_type="concept", tags=[], status=NodeStatus.draft)
+            b = Node(id="gd2-b", workspace_id="test-ws-1", concept_path="d2_b.md",
+                      title="B", node_type="concept", tags=[], status=NodeStatus.draft)
+            c = Node(id="gd2-c", workspace_id="test-ws-1", concept_path="d2_c.md",
+                      title="C", node_type="concept", tags=[], status=NodeStatus.draft)
+            session.add_all([a, b, c])
+            session.add_all([
+                Edge(id="ge2a", workspace_id="test-ws-1", source_id="gd2-a", target_id="gd2-b", edge_type="references"),
+                Edge(id="ge2b", workspace_id="test-ws-1", source_id="gd2-b", target_id="gd2-c", edge_type="related_to"),
+            ])
+            await session.commit()
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            headers = {"Authorization": f"Bearer {seed_data['token']}"}
+            resp = await c.get("/v1/knowledge/gd2-a/graph?workspace_id=test-ws-1&depth=2", headers=headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["nodes"]) == 3
+        assert len(data["edges"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_subgraph_not_found(self, test_db, seed_data):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.get("/v1/knowledge/nonexistent/graph?workspace_id=test-ws-1",
+                               headers={"Authorization": f"Bearer {seed_data['token']}"})
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_graph_path(self, test_db, seed_data):
+        factory = test_db
+        async with factory() as session:
+            a = Node(id="gp-a", workspace_id="test-ws-1", concept_path="gp_a.md",
+                      title="Alpha", node_type="concept", tags=[], status=NodeStatus.draft)
+            b = Node(id="gp-b", workspace_id="test-ws-1", concept_path="gp_b.md",
+                      title="Beta", node_type="concept", tags=[], status=NodeStatus.draft)
+            c = Node(id="gp-c", workspace_id="test-ws-1", concept_path="gp_c.md",
+                      title="Gamma", node_type="concept", tags=[], status=NodeStatus.draft)
+            session.add_all([a, b, c])
+            session.add_all([
+                Edge(id="gpea", workspace_id="test-ws-1", source_id="gp-a", target_id="gp-b", edge_type="references"),
+                Edge(id="gpeb", workspace_id="test-ws-1", source_id="gp-b", target_id="gp-c", edge_type="depends_on"),
+            ])
+            await session.commit()
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/v1/graph/path",
+                                headers={"Authorization": f"Bearer {seed_data['token']}"},
+                                json={"workspace_id": "test-ws-1", "source_id": "gp-a", "target_id": "gp-c"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["path_found"] is True
+        assert len(data["nodes"]) == 3
+        assert len(data["edges"]) == 2
+        assert data["edges"][0]["source"] == "gp-a"
+
+    @pytest.mark.asyncio
+    async def test_graph_path_not_found(self, test_db, seed_data):
+        factory = test_db
+        async with factory() as session:
+            a = Node(id="gpn-a", workspace_id="test-ws-1", concept_path="gpn_a.md",
+                      title="A", node_type="concept", tags=[], status=NodeStatus.draft)
+            b = Node(id="gpn-b", workspace_id="test-ws-1", concept_path="gpn_b.md",
+                      title="B", node_type="concept", tags=[], status=NodeStatus.draft)
+            session.add_all([a, b])
+            await session.commit()
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/v1/graph/path",
+                                headers={"Authorization": f"Bearer {seed_data['token']}"},
+                                json={"workspace_id": "test-ws-1", "source_id": "gpn-a", "target_id": "gpn-b"})
+        assert resp.status_code == 200
+        assert resp.json()["path_found"] is False

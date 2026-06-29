@@ -171,6 +171,31 @@ class EdgeResponse(BaseModel):
     created_at: datetime
 
 
+class GraphNode(BaseModel):
+    id: str
+    label: str
+    type: str
+    filepath: str
+
+class GraphEdge(BaseModel):
+    source: str
+    target: str
+    type: str
+
+class SubgraphResponse(BaseModel):
+    nodes: List[GraphNode]
+    edges: List[GraphEdge]
+
+class PathRequest(BaseModel):
+    workspace_id: str
+    source_id: str
+    target_id: str
+
+class PathResponse(BaseModel):
+    nodes: List[GraphNode]
+    edges: List[GraphEdge]
+    path_found: bool
+
 class TokenData(BaseModel):
     user_id: str
     workspace_id: str
