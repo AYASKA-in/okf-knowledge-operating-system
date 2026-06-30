@@ -32,23 +32,25 @@ function DetailSkeleton() {
 export default function ConceptDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const { activeWorkspaceId } = useAuth()
   const [node, setNode] = useState<Node | null>(null)
   const [edges, setEdges] = useState<Edge[]>([])
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     if (!id) return
+    if (!activeWorkspaceId) return
     Promise.all([
       api.get<Node>(`/v1/knowledge/${id}`),
-      api.get<{ items: Edge[] }>(`/v1/edges?source_id=${id}`),
+      api.get<{ nodes?: Node[]; edges: Edge[] }>(`/v1/knowledge/${id}/edges?workspace_id=${activeWorkspaceId}`),
     ])
       .then(([nodeData, edgeData]) => {
         setNode(nodeData)
-        setEdges(edgeData.items || edgeData)
+        setEdges(edgeData.edges || [])
       })
       .catch(console.error)
       .finally(() => setLoading(false))
-  }, [id])
+  }, [id, activeWorkspaceId])
 
   if (loading) {
     return (
@@ -116,19 +118,24 @@ export default function ConceptDetail() {
               <div>
                 <h3 className="text-sm font-medium mb-3">Relationships ({edges.length})</h3>
                 <div className="space-y-2">
-                  {edges.map(edge => (
-                    <div key={edge.id} className="flex items-center gap-2 text-sm p-2 bg-muted/30 rounded">
-                      <span className="text-muted-foreground capitalize">{edge.relationship}</span>
-                      <Button
-                        variant="link"
-                        size="sm"
-                        className="h-auto p-0"
-                        onClick={() => navigate(`/concept/${edge.target_id}`)}
-                      >
-                        {edge.target_id.slice(0, 8)}... <ExternalLink className="h-3 w-3 ml-1" />
-                      </Button>
-                    </div>
-                  ))}
+                  {edges.map(edge => {
+                    const isOutbound = edge.source_id === id
+                    const relatedId = isOutbound ? edge.target_id : edge.source_id
+                    const label = isOutbound ? edge.relationship : `← ${edge.relationship}`
+                    return (
+                      <div key={edge.id} className="flex items-center gap-2 text-sm p-2 bg-muted/30 rounded">
+                        <span className="text-muted-foreground capitalize">{label}</span>
+                        <Button
+                          variant="link"
+                          size="sm"
+                          className="h-auto p-0"
+                          onClick={() => navigate(`/concept/${relatedId}`)}
+                        >
+                          {relatedId.slice(0, 8)}... <ExternalLink className="h-3 w-3 ml-1" />
+                        </Button>
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
             </>
